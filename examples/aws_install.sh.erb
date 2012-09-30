@@ -1,0 +1,97 @@
+#!/bin/bash -ex
+
+# Auto-scaling capistrano like deployment script.
+
+# Begin S3 Credentials parsing.
+IAM_ROLE=<%= configuration[:aws_ec2_iam_role] %>
+# Begin application configuration
+APPLICATION=<%= configuration[:application] %>
+
+AWS_RELEASES_BUCKET=<%= configuration[:aws_releases_bucket] %>
+RAILS_ENV=<%= configuration[:rails_env] %>              # e.g. production
+DEPLOY_TO=<%= configuration[:deploy_to] %>              # e.g. /home/ubuntu/myapp
+RELEASES_PATH=<%= configuration[:releases_path] %>      # e.g. /home/ubuntu/myapp/releases
+RELEASE_PATH=<%= configuration[:release_path] %>        # e.g. /home/ubuntu/myapp/releases/20120428210958
+SHARED_PATH=<%= configuration[:shared_path] %>          # e.g. /home/ubuntu/myapp/shared
+CURRENT_PATH=<%= configuration[:current_path] %>        # e.g. /home/ubuntu/myapp/current
+
+PACKAGE_NAME=<%= File.basename(filename) %>             # e.g. 20120428210958.tar.gz
+DOWNLOADED_PACKAGE_PATH=<%= remote_filename %>          # e.g. /tmp/20120428210958.tar.gz
+DECOMPRESS_CMD="<%= decompress(remote_filename).join(" ") %>" # e.g. tar xfz /tmp/20120428210958.tar.gz
+S3_PACKAGE_PATH=${RAILS_ENV}/${APPLICATION}/${PACKAGE_NAME}   # e.g. production/myapp/20120428210958.tar.gz
+
+KEEP_RELEASES=<%= configuration[:keep_releases] %>
+
+# EC2 IAM Role parsing.
+AWS_CREDENTIALS="`curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/${IAM_ROLE}`"
+AWS_ACCESS_KEY_ID="$(ruby -r json -e 'puts JSON.parse(ARGV[0])["AccessKeyId"]' "$AWS_CREDENTIALS")"
+AWS_SECRET_ACCESS_KEY="$(ruby -r json -e 'puts JSON.parse(ARGV[0])["SecretAccessKey"]' "$AWS_CREDENTIALS")"
+AWS_SECRET_TOKEN="$(ruby -r json -e 'puts JSON.parse(ARGV[0])["Token"]' "$AWS_CREDENTIALS")"
+
+if [ -z "$AWS_ACCESS_KEY_ID" ]; then
+  echo "Expecting the environment variable AWS_ACCESS_KEY_ID to be set"
+  exit 1
+fi
+
+if [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
+  echo "Expecting the environment variable AWS_SECRET_ACCESS_KEY to be set"
+  exit 2
+fi
+
+if [ -z "$AWS_SECRET_TOKEN" ]; then
+  echo "Expecting the environment variable AWS_SECRET_TOKEN to be set"
+  exit 2
+fi
+
+expires=${6:-$((`date +%s`+60))}
+stringToSign="GET\n\n\n${expires}\nx-amz-security-token:${AWS_SECRET_TOKEN}\n/${AWS_RELEASES_BUCKET}/${S3_PACKAGE_PATH}"
+base64Signature=`echo -en "${stringToSign}" | openssl dgst -sha1 -binary -hmac ${AWS_SECRET_ACCESS_KEY} | openssl base64`
+escapedSignature="$(ruby -r cgi -e 'puts CGI.escape(ARGV[0])' "$base64Signature")"
+escapedAwsKey="$(ruby -r cgi -e 'puts CGI.escape(ARGV[0])' "$AWS_ACCESS_KEY_ID")"
+escapedToken="$(ruby -r cgi -e 'puts CGI.escape(ARGV[0])' "$AWS_SECRET_TOKEN")"
+
+URL="http://s3.amazonaws.com/${AWS_RELEASES_BUCKET}/${S3_PACKAGE_PATH}?AWSAccessKeyId=${escapedAwsKey}&Signature=${escapedSignature}&Expires=${expires}&x-amz-security-token=${escapedToken}"
+
+mkdir -p  $DEPLOY_TO $RELEASES_PATH $SHARED_PATH ${SHARED_PATH}/system ${SHARED_PATH}/log ${SHARED_PATH}/pids
+chmod g+w $DEPLOY_TO $RELEASES_PATH $SHARED_PATH ${SHARED_PATH}/system ${SHARED_PATH}/log ${SHARED_PATH}/pids
+
+chmod -R g+w ${DEPLOY_TO}
+
+curl -s -o $DOWNLOADED_PACKAGE_PATH --url "$URL"
+cd ${RELEASES_PATH} && ${DECOMPRESS_CMD} && rm ${DOWNLOADED_PACKAGE_PATH}
+
+cd ${RELEASE_PATH} && bundle install --gemfile ${RELEASE_PATH}/Gemfile --path ${SHARED_PATH}/bundle --deployment --quiet --without development test
+
+chmod -R g+w ${RELEASE_PATH}
+rm -rf ${RELEASE_PATH}/public/system && mkdir -p ${RELEASE_PATH}/public/
+ln -s ${SHARED_PATH}/system ${RELEASE_PATH}/public/system
+rm -rf ${RELEASE_PATH}/log
+ln -s ${SHARED_PATH}/log ${RELEASE_PATH}/log
+rm -rf ${RELEASE_PATH}/tmp/pids && mkdir -p ${RELEASE_PATH}/tmp/
+ln -s ${SHARED_PATH}/pids ${RELEASE_PATH}/tmp/pids
+
+rm -f ${CURRENT_PATH} && ln -s ${RELEASE_PATH} ${CURRENT_PATH}
+
+cd ${RELEASE_PATH} && rvmsudo bundle exec foreman export upstart /etc/init -f ./Procfile.production -a ${APPLICATION} -u ubuntu -l ${SHARED_PATH}/log
+
+sudo start ${APPLICATION} || sudo restart ${APPLICATION}
+
+# Cleanup older releases.
+versions=`ls -xt $RELEASES_PATH`
+releases=(${versions// / })
+
+releases_count=${#releases[@]}
+
+if [ $releases_count -le $KEEP_RELEASES ]
+then
+  echo 'no old releases to clean up'
+else
+  echo keeping $KEEP_RELEASES of $releases_count deployed releases
+  releases=(${releases[@]:0:0} ${releases[@]:($KEEP_RELEASES)})
+
+  for release in "${releases[@]}"
+  do
+    path=$releases_path$release
+    `rm -rf $path`
+  done
+fi
