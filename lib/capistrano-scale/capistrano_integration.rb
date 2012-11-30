@@ -21,14 +21,22 @@ module CapistranoScale
                 :key        => capistrano_config[:aws_releases_bucket],
                 :public     => false
               )
-              logger.debug "Uploading initialization script to S3"
-              file = aws_directory.files.create(
-                :key        => "#{rails_env}/#{application}/aws_install.sh",
+              logger.debug "Uploading #{install_cmd_path} initialization script to S3"
+              key = "#{rails_env}/#{application}/aws_install.sh"
+              existing = aws_directory.files.get(key)
+              existing.destroy if existing
+              file = aws_directory.files.new(
+                :key        => key,
                 :body       => File.open(install_cmd_path),
                 :acl        => 'public-read',
                 :encryption => 'AES256'
               )
-              logger.debug "AWS Install script uploaded."
+              begin
+                file.save
+                logger.debug "AWS Install script uploaded in #{key}"
+              rescue => e
+                raise(Capistrano::Error, "S3 File upload failed: #{e.class.to_s}:#{e.message}")
+              end
             end
           end
         end
